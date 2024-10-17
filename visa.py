@@ -1,8 +1,10 @@
 import time
+import traceback
 import json
 import random
 import requests
 import configparser
+import threading
 from datetime import datetime
 
 from selenium import webdriver
@@ -10,7 +12,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait as Wait
 from selenium.webdriver.common.by import By
-from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.microsoft import EdgeChromiumDriverManager
 
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
@@ -18,7 +20,8 @@ from sendgrid.helpers.mail import Mail
 from embassy import *
 
 config = configparser.ConfigParser()
-config.read('config.ini')
+config.optionxform = str
+config.read(r'config.ini')
 
 # Personal Info:
 # Account and current appointment info from https://ais.usvisa-info.com
@@ -73,6 +76,7 @@ APPOINTMENT_URL = f"https://ais.usvisa-info.com/{EMBASSY}/niv/schedule/{SCHEDULE
 DATE_URL = f"https://ais.usvisa-info.com/{EMBASSY}/niv/schedule/{SCHEDULE_ID}/appointment/days/{FACILITY_ID}.json?appointments[expedite]=false"
 TIME_URL = f"https://ais.usvisa-info.com/{EMBASSY}/niv/schedule/{SCHEDULE_ID}/appointment/times/{FACILITY_ID}.json?date=%s&appointments[expedite]=false"
 SIGN_OUT_LINK = f"https://ais.usvisa-info.com/{EMBASSY}/niv/users/sign_out"
+INSTRUCTION_LINK = f"https://ais.usvisa-info.com/{EMBASSY}/niv/schedule/{SCHEDULE_ID}/appointment/instructions"
 
 JS_SCRIPT = ("var req = new XMLHttpRequest();"
              f"req.open('GET', '%s', false);"
@@ -82,36 +86,49 @@ JS_SCRIPT = ("var req = new XMLHttpRequest();"
              "req.send(null);"
              "return req.responseText;")
 
+#//////////////////////////////////////////////////////////////////
+LOG_FILE_NAME = f"log/log_" + str(datetime.now().date()) + ".txt"
+LOG_FILE_HANDLE = open(LOG_FILE_NAME, 'a')
+PED = datetime.strptime(PRIOD_END, "%Y-%m-%d")
+PSD = datetime.strptime(PRIOD_START, "%Y-%m-%d")
+#/////////////////////////////////////////////////////////////////
+IS_SLEEPING = False
+PRINT_BUFFER = ''
+__DEBUG = False
+#/////////////////////////////////////////////////////////////////
+
 def send_notification(title, msg):
-    print(f"Sending notification!")
-    if SENDGRID_API_KEY:
-        message = Mail(from_email=USERNAME, to_emails=USERNAME, subject=msg, html_content=msg)
-        try:
-            sg = SendGridAPIClient(SENDGRID_API_KEY)
-            response = sg.send(message)
-            print(response.status_code)
-            print(response.body)
-            print(response.headers)
-        except Exception as e:
-            print(e.message)
-    if PUSHOVER_TOKEN:
-        url = "https://api.pushover.net/1/messages.json"
-        data = {
-            "token": PUSHOVER_TOKEN,
-            "user": PUSHOVER_USER,
-            "message": msg
-        }
-        requests.post(url, data)
-    if PERSONAL_SITE_USER:
-        url = PERSONAL_PUSHER_URL
-        data = {
-            "title": "VISA - " + str(title),
-            "user": PERSONAL_SITE_USER,
-            "pass": PERSONAL_SITE_PASS,
-            "email": PUSH_TARGET_EMAIL,
-            "msg": msg,
-        }
-        requests.post(url, data)
+    global __DEBUG
+    if not __DEBUG:
+        print(f"Sending notification!")
+        if SENDGRID_API_KEY:
+            message = Mail(from_email=USERNAME, to_emails=USERNAME, subject=msg, html_content=msg)
+            try:
+                sg = SendGridAPIClient(SENDGRID_API_KEY)
+                response = sg.send(message)
+                print(response.status_code)
+                print(response.body)
+                print(response.headers)
+            except Exception as e:
+                print(e.message)
+        if PUSHOVER_TOKEN:
+            url = "https://api.pushover.net/1/messages.json"
+            data = {
+                "token": PUSHOVER_TOKEN,
+                "user": PUSHOVER_USER,
+                "message": msg
+            }
+            requests.post(url, data)
+        if PERSONAL_SITE_USER:
+            url = PERSONAL_PUSHER_URL
+            data = {
+                "title": "VISA - " + str(title),
+                "user": PERSONAL_SITE_USER,
+                "pass": PERSONAL_SITE_PASS,
+                "email": PUSH_TARGET_EMAIL,
+                "msg": msg,
+            }
+            requests.post(url, data)
 
 
 def auto_action(label, find_by, el_type, action, value, sleep_time=0):
@@ -154,8 +171,7 @@ def start_process():
     Wait(driver, 60).until(EC.presence_of_element_located((By.XPATH, "//a[contains(text(), '" + REGEX_CONTINUE + "')]")))
     print("\n\tlogin successful!\n")
 
-def reschedule(date):
-    time = get_time(date)
+def reschedule(date, time):
     driver.get(APPOINTMENT_URL)
     headers = {
         "User-Agent": driver.execute_script("return navigator.userAgent;"),
@@ -163,7 +179,6 @@ def reschedule(date):
         "Cookie": "_yatri_session=" + driver.get_cookie("_yatri_session")["value"]
     }
     data = {
-        "utf8": driver.find_element(by=By.NAME, value='utf8').get_attribute('value'),
         "authenticity_token": driver.find_element(by=By.NAME, value='authenticity_token').get_attribute('value'),
         "confirmed_limit_message": driver.find_element(by=By.NAME, value='confirmed_limit_message').get_attribute('value'),
         "use_consulate_appointment_capacity": driver.find_element(by=By.NAME, value='use_consulate_appointment_capacity').get_attribute('value'),
@@ -172,16 +187,20 @@ def reschedule(date):
         "appointments[consulate_appointment][time]": time,
     }
     r = requests.post(APPOINTMENT_URL, headers=headers, data=data)
-    if(r.text.find('Successfully Scheduled') != -1):
-        title = "SUCCESS"
-        msg = f"Rescheduled Successfully! {date} {time}"
+
+
+    if(r.text.find('You have successfully') != -1):
+        title = "Reschedule Success"
+        msg = f"US VISA reschedule successed on {date} : {time}"
     else:
-        title = "FAIL"
-        msg = f"Reschedule Failed!!! {date} {time}"
+        title = "Reschedule Fail"
+        msg = f"US VISA reschedule failed on {date} : {time}"
+        info_logger(msg)
+        print(r.text)
     return [title, msg]
 
 
-def get_date():
+def get_date(): 
     # Requesting to get the whole available dates
     session = driver.get_cookie("_yatri_session")["value"]
     script = JS_SCRIPT % (str(DATE_URL), session)
@@ -189,15 +208,20 @@ def get_date():
     return json.loads(content)
 
 def get_time(date):
-    time_url = TIME_URL % date
-    session = driver.get_cookie("_yatri_session")["value"]
-    script = JS_SCRIPT % (str(time_url), session)
-    content = driver.execute_script(script)
-    data = json.loads(content)
-    time = data.get("available_times")[-1]
-    print(f"Got time successfully! {date} {time}")
-    return time
-
+    if date:
+        time_url = TIME_URL % date
+        session = driver.get_cookie("_yatri_session")["value"]
+        script = JS_SCRIPT % (str(time_url), session)
+        content = driver.execute_script(script)
+        data = json.loads(content)
+        time_list = data.get("available_times")
+        if time_list:
+            time = time_list[-1]
+            info_logger(f"Got time successfully! {date} {time}")
+            return time
+        else:
+            info_logger(f"Time list is for {date} is empty!")
+    return None
 
 def is_logged_in():
     content = driver.page_source
@@ -205,100 +229,168 @@ def is_logged_in():
         return False
     return True
 
+def is_in_period(date):
+    new_date = datetime.strptime(date, "%Y-%m-%d")
+    result = ( PED > new_date and new_date > PSD )
+    # print(f'{new_date.date()} : {result}', end=", ")
+    if result:
+        info_logger("Is a valid date: {}".format(date))
+        return date
+    info_logger("Is not a valid date: {}".format(date))
+    return None
 
-def get_available_date(dates):
-    # Evaluation of different available dates
-    def is_in_period(date, PSD, PED):
-        new_date = datetime.strptime(date, "%Y-%m-%d")
-        result = ( PED > new_date and new_date > PSD )
-        # print(f'{new_date.date()} : {result}', end=", ")
-        return result
+# def get_available_date(dates):
+#     # Evaluation of different available dates
+#     def is_in_period(date, PSD, PED):
+#         new_date = datetime.strptime(date, "%Y-%m-%d")
+#         result = ( PED > new_date and new_date > PSD )
+#         # print(f'{new_date.date()} : {result}', end=", ")
+#         return result
     
-    PED = datetime.strptime(PRIOD_END, "%Y-%m-%d")
-    PSD = datetime.strptime(PRIOD_START, "%Y-%m-%d")
-    for d in dates:
-        date = d.get('date')
-        if is_in_period(date, PSD, PED):
-            return date
-    print(f"\n\nNo available dates between ({PSD.date()}) and ({PED.date()})!")
+#     PED = datetime.strptime(PRIOD_END, "%Y-%m-%d")
+#     PSD = datetime.strptime(PRIOD_START, "%Y-%m-%d")
+#     for d in dates:
+#         date = d.get('date')
+#         if is_in_period(date, PSD, PED):
+#             info_logger("Is a availiable date: {}".format(date))
+#             return date
+#     print(f"\n\nNo available dates between ({PSD.date()}) and ({PED.date()})!")
 
 
-def info_logger(file_path, log):
-    # file_path: e.g. "log.txt"
-    with open(file_path, "a") as file:
-        file.write(str(datetime.now().time()) + ":\n" + log + "\n")
+def info_logger(log, new = False):
+    time_stamp = str(datetime.now().time())
+    if new:
+        LOG_FILE_HANDLE.write(f"{'=' * 120}\n")
+        LOG_FILE_HANDLE.writelines(f"|{time_stamp}|" + i + '\n' for i in log.split('\n') if i)
+    else:
+        LOG_FILE_HANDLE.writelines(f"|{time_stamp}|" + i + '\n' for i in log.split('\n') if i)
 
+def flush_logger():
+    global IS_SLEEPING
+    while 1:
+        if IS_SLEEPING:
+            LOG_FILE_HANDLE.flush()
+
+def delay_print(txt):
+    global PRINT_BUFFER
+    global IS_SLEEPING
+    if not IS_SLEEPING:
+        PRINT_BUFFER = PRINT_BUFFER + '\n' + txt
+
+def delay_print_flush():
+    global IS_SLEEPING
+    global PRINT_BUFFER
+    while 1:
+        if IS_SLEEPING and (PRINT_BUFFER != ''): 
+            print (PRINT_BUFFER)
+            PRINT_BUFFER = ''
+
+def main_thread_sleep(sleep_time):
+    global IS_SLEEPING
+    IS_SLEEPING = True
+    time.sleep(sleep_time)
+    IS_SLEEPING = False
+
+def update_ini_end_date(date):
+    config['PERSONAL_INFO']['PRIOD_END'] = date
+    with open(r'config.ini', 'w') as f:
+        config.write(f)
 
 if LOCAL_USE:
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
+    driver = webdriver.Edge(service=Service(EdgeChromiumDriverManager().install()))
 else:
     driver = webdriver.Remote(command_executor=HUB_ADDRESS, options=webdriver.ChromeOptions())
 
 
 if __name__ == "__main__":
-    first_loop = True
-    while 1:
-        LOG_FILE_NAME = "log_" + str(datetime.now().date()) + ".txt"
-        if first_loop:
-            t0 = time.time()
-            total_time = 0
-            Req_count = 0
-            start_process()
-            first_loop = False
-        Req_count += 1
-        try:
-            msg = "-" * 60 + f"\nRequest count: {Req_count}, Log time: {datetime.today()}\n"
-            print(msg)
-            info_logger(LOG_FILE_NAME, msg)
-            dates = get_date()
-            if not dates:
-                # Ban Situation
-                msg = f"List is empty, Probabely banned!\n\tSleep for {BAN_COOLDOWN_TIME} hours!\n"
-                print(msg)
-                info_logger(LOG_FILE_NAME, msg)
-                send_notification("BAN", msg)
-                driver.get(SIGN_OUT_LINK)
-                time.sleep(BAN_COOLDOWN_TIME * hour)
-                first_loop = True
-            else:
-                # Print Available dates:
-                msg = ""
-                for d in dates:
-                    msg = msg + "%s" % (d.get('date')) + ", "
-                msg = "Available dates:\n"+ msg
-                print(msg)
-                info_logger(LOG_FILE_NAME, msg)
-                date = get_available_date(dates)
-                if date:
-                    # A good date to schedule for
-                    END_MSG_TITLE, msg = reschedule(date)
-                    break
-                RETRY_WAIT_TIME = random.randint(RETRY_TIME_L_BOUND, RETRY_TIME_U_BOUND)
-                t1 = time.time()
-                total_time = t1 - t0
-                msg = "\nWorking Time:  ~ {:.2f} minutes".format(total_time/minute)
-                print(msg)
-                info_logger(LOG_FILE_NAME, msg)
-                if total_time > WORK_LIMIT_TIME * hour:
-                    # Let program rest a little
-                    send_notification("REST", f"Break-time after {WORK_LIMIT_TIME} hours | Repeated {Req_count} times")
+    try:
+        first_loop = True
+        while 1:
+            if first_loop:
+                t0 = time.time()
+                total_time = 0
+                Req_count = 0
+                start_process()
+                log_flushing_thread = threading.Thread(target=flush_logger, daemon=True)
+                delay_print_thread  = threading.Thread(target=delay_print_flush, daemon=True)
+                log_flushing_thread.start()
+                delay_print_thread.start()
+                first_loop = False
+            Req_count += 1
+            try:
+                msg = f"Request count: {Req_count}\n"
+                delay_print('^' * 60)
+                delay_print(msg)
+                info_logger(msg, new=True)
+                dates = get_date()
+                if not dates:
+                    # Ban Situation
+                    msg = f"List is empty, Probabely banned!\nSleep for {BAN_COOLDOWN_TIME} hours!\n"
+                    delay_print(msg)
+                    info_logger(msg)
                     driver.get(SIGN_OUT_LINK)
-                    time.sleep(WORK_COOLDOWN_TIME * hour)
+                    main_thread_sleep(BAN_COOLDOWN_TIME * hour)
                     first_loop = True
                 else:
-                    msg = "Retry Wait Time: "+ str(RETRY_WAIT_TIME)+ " seconds"
-                    print(msg)
-                    info_logger(LOG_FILE_NAME, msg)
-                    time.sleep(RETRY_WAIT_TIME)
-        except:
-            # Exception Occured
-            msg = f"Break the loop after exception!\n"
-            END_MSG_TITLE = "EXCEPTION"
-            break
+                    msg = f"First Available Date: {dates[0].get('date')}"
+                    delay_print(msg)
+                    info_logger(msg)
+                    #Scan through dates and try book every valid date
+                    END_MSG_TITLE, msg, avail_date_str = '', '', ''
+                    for date_obj in dates:
+                        delay_print(f"Checking date {date_obj.get('date')}")
+                        date = is_in_period(date_obj.get('date')) 
+                        if date:
+                            aval_time = get_time(date)
+                            if aval_time:
+                                END_MSG_TITLE, msg = reschedule(date, aval_time)
+                                if (END_MSG_TITLE == 'Reschedule Success'):
+                                    update_ini_end_date(date)
+                                    break
+                                else:
+                                    send_notification(END_MSG_TITLE, msg)
+                        else:
+                            break
+                    if END_MSG_TITLE == 'Reschedule Success':
+                        break
+                    RETRY_WAIT_TIME = random.randint(RETRY_TIME_L_BOUND, RETRY_TIME_U_BOUND)
+                    t1 = time.time()
+                    total_time = t1 - t0
+                    msg = "\nWorking Time:  ~ {:.2f} minutes".format(total_time/minute)
+                    delay_print(msg)
+                    info_logger(msg)
+                    if total_time > WORK_LIMIT_TIME * hour:
+                        # Let program rest a little
+                        # send_notification("REST", f"Break-time after {WORK_LIMIT_TIME} hours | Repeated {Req_count} times")
+                        driver.get(SIGN_OUT_LINK)
+                        main_thread_sleep(WORK_COOLDOWN_TIME * hour)
+                        first_loop = True
+                    else:
+                        msg = "Retry Wait Time: "+ str(RETRY_WAIT_TIME)+ " seconds"
+                        delay_print(msg)
+                        info_logger(msg)
+                        main_thread_sleep(RETRY_WAIT_TIME)
+            except Exception:
+                # Exception Occured
+                msg = f"Break the loop after exception!\n,{traceback.format_exc()}\n"
+                info_logger(msg)
+
+                driver.get(SIGN_OUT_LINK)
+                driver.stop_client()
+                driver.quit()
+                #-=---------------------- Restart New Process
+                if LOCAL_USE:
+                    driver = webdriver.Edge(service=Service(EdgeChromiumDriverManager().install()))
+                else:
+                    driver = webdriver.Remote(command_executor=HUB_ADDRESS, options=webdriver.ChromeOptions())
+                first_loop = True
+                continue   
+    except:
+        END_MSG_TITLE = "EXCEPTION"
+        msg = f"Unknown Exception Occured!\n{traceback.format_exc()}\n"
+        pass
 
 print(msg)
-info_logger(LOG_FILE_NAME, msg)
+info_logger(END_MSG_TITLE)
+info_logger(msg)
 send_notification(END_MSG_TITLE, msg)
-driver.get(SIGN_OUT_LINK)
-driver.stop_client()
-driver.quit()
